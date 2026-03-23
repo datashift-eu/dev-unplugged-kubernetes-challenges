@@ -3,6 +3,17 @@
 const { password, database } = require("pg/lib/defaults");
 const { validateMinio, validatePostgres, httpGet, friendlyHttpError } = require("./validators");
 
+const MINIO = {
+  endPoint:  "localhost",
+  port:      9000,
+  useSSL:    false,
+  accessKey: "depot-admin",
+  secretKey: "Vu3lD3p0tS3cr3t!",
+};
+
+const ARGO_API  = "http://localhost:2746";
+const NAMESPACE = "argo";
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  challenges.js  —  Planet & Challenge Configuration
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -515,7 +526,529 @@ const PLANETS = [
     },
     ],
   },
+  {
+    name: "Archivon",
+    icon: "📦",
+    color: "\x1b[94m",   // brightBlue
+    system: "Argo Reach",
+    flavour: [
+      "A vast automated sorting world, its surface covered in conveyor belts and",
+      "processing silos. Cargoes arrive compressed, unreadable — a workflow engine",
+      "once extracted them automatically, but the pipeline has gone dark.",
+      "Four systems need rebuilding: the landing bucket, the processing template,",
+      "the event trigger, and finally a live end-to-end run.",
+    ].join(" "),
 
+    challenges: [
+
+      // ── Challenge 301 ─────────────────────────────────────────────────────────
+      {
+        id: 301,
+        title: "Prepare the Landing Zone",
+        category: "DevOps",
+        difficulty: "easy",
+        points: 20,
+
+        description: [
+          "The cargo sorting pipeline needs a MinIO bucket as its landing zone.",
+          "Incoming compressed archives must arrive under one prefix;",
+          "processed output must land under another.",
+          "",
+          "Create a bucket named 'drop-zone' with these two prefixes:",
+          "",
+          "  incoming/    ← zip files are uploaded here",
+          "  processed/   ← workflow writes extracted files here",
+          "",
+          "MinIO is on localhost:9000 (credentials: depot-admin / Vu3lD3p0tS3cr3t!).",
+          "Prefixes are just placeholder objects — upload a zero-byte object",
+          "named 'incoming/.keep' and 'processed/.keep' to create them.",
+          "",
+          "Type 'done' when both prefixes exist.",
+        ].join("\n"),
+
+        examples: [
+          { output: "mc cp /dev/null depot/drop-zone/incoming/.keep", explanation: "create the prefix" },
+        ],
+
+        hints: [
+          "mc alias set depot http://localhost:9000 depot-admin 'Vu3lD3p0tS3cr3t!'",
+          "mc mb depot/drop-zone",
+          "echo '' | mc pipe depot/drop-zone/incoming/.keep\necho '' | mc pipe depot/drop-zone/processed/.keep",
+        ],
+
+        async validator(answer) {
+          if (!answer.trim()) return { ok: false, message: "Type 'done' when ready." };
+
+          return validateMinio({
+            ...MINIO,
+            checks: [
+              {
+                label: "drop-zone bucket exists",
+                async run(client) {
+                  const exists = await client.bucketExists("drop-zone");
+                  return exists ? true : "Bucket 'drop-zone' not found. Run: mc mb depot/drop-zone";
+                },
+              },
+              {
+                label: "incoming/ prefix exists",
+                async run(client) {
+                  const keys = await listObjects(client, "drop-zone", "incoming/");
+                  return keys.length > 0
+                    ? true
+                    : "No objects found under 'incoming/' — upload incoming/.keep to create the prefix.";
+                },
+              },
+              {
+                label: "processed/ prefix exists",
+                async run(client) {
+                  const keys = await listObjects(client, "drop-zone", "processed/");
+                  return keys.length > 0
+                    ? true
+                    : "No objects found under 'processed/' — upload processed/.keep to create the prefix.";
+                },
+              },
+            ],
+          });
+        },
+      },
+
+      // ── Challenge 302 ─────────────────────────────────────────────────────────
+      {
+        id: 302,
+        title: "Deploy the Unzip Template",
+        category: "DevOps",
+        difficulty: "hard",
+        points: 40,
+
+        description: [
+          "Deploy an Argo WorkflowTemplate named 'unzip-pipeline' in the argo namespace.",
+          "It must accept two arguments and process a zip from MinIO:",
+          "",
+          "  Parameters:",
+          "    bucket   — the source MinIO bucket  (default: drop-zone)",
+          "    key      — the object key of the zip (e.g. incoming/payload.zip)",
+          "",
+          "The unzip app is provided. Build a docker image and call from WorkflowTemplate.",
+          "",
+          "  The workflow needs a MinIO secret wired in as env vars:",
+          "    MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY",
+          "",
+          "Type 'done' when the WorkflowTemplate exists in the cluster.",
+        ].join("\n"),
+
+        examples: [
+          { output: "workflowtemplate.argoproj.io/unzip-pipeline created" },
+        ],
+
+        hints: [
+          "kubectl apply -f unzip-pipeline.yaml -n argo",
+          "kubectl get workflowtemplate -n argo   ← verify it was created",
+        ],
+
+        async validator(answer) {
+          if (!answer.trim()) return { ok: false, message: "Type 'done' when ready." };
+
+          // Query the Argo Server API for the WorkflowTemplate
+          let res;
+          try {
+            res = await httpGet(
+              `${ARGO_API}/api/v1/workflow-templates/${NAMESPACE}/unzip-pipeline`
+            );
+          } catch (err) {
+            if (err.code === "ECONNREFUSED" || err.code === "ETIMEOUT") {
+              return {
+                ok: false,
+                message: `Cannot reach Argo Server at ${ARGO_API}. Run: kubectl port-forward svc/argo-server 2746:2746 -n argo`,
+              };
+            }
+            return { ok: false, message: `Argo API error: ${err.message}` };
+          }
+
+          if (res.status === 404) {
+            return {
+              ok: false,
+              message: "WorkflowTemplate 'unzip-pipeline' not found in namespace 'argo'. Did you kubectl apply it?",
+            };
+          }
+          if (res.status !== 200) {
+            return { ok: false, message: `Argo API returned HTTP ${res.status}: ${JSON.stringify(res.body)}` };
+          }
+
+          // Verify it has the expected entrypoint and arguments
+          const spec = res.body?.spec || {};
+          const tpls = spec.templates || [];
+          const args = spec.arguments?.parameters || [];
+
+          const hasBucketParam = args.some(p => p.name === "bucket");
+          const hasKeyParam = args.some(p => p.name === "key");
+
+          if (!hasBucketParam || !hasKeyParam) {
+            return {
+              ok: false,
+              message: `WorkflowTemplate exists but is missing required parameters. Need: bucket, key. Found: ${args.map(p => p.name).join(", ") || "none"}`,
+            };
+          }
+
+          if (tpls.length === 0) {
+            return { ok: false, message: "WorkflowTemplate has no templates defined." };
+          }
+
+          return {
+            ok: true,
+            message: `WorkflowTemplate 'unzip-pipeline' found with ${tpls.length} template(s) and correct parameters ✓`,
+          };
+        },
+      },
+
+      // ── Challenge 303 ─────────────────────────────────────────────────────────
+      {
+        id: 303,
+        title: "Wire the Event Trigger",
+        category: "DevOps",
+        difficulty: "hard",
+        points: 50,
+
+        description: [
+          "The WorkflowTemplate is deployed but nothing triggers it.",
+          "Set up Argo Events to watch MinIO and fire automatically:",
+          "",
+          "  EventSource  name : minio-drop-zone",
+          "    watches bucket  : drop-zone",
+          "    prefix filter   : incoming/",
+          "    events          : s3:ObjectCreated:*",
+          "",
+          "  Sensor       name : unzip-sensor",
+          "    dependency      : minio-drop-zone",
+          "    trigger         : submit WorkflowTemplate 'unzip-pipeline'",
+          "    pass key as     : key parameter  (from the event payload)",
+          "",
+          "Both must be in the argo namespace.",
+          "Type 'done' when both exist and are in a healthy state.",
+        ].join("\n"),
+
+        examples: [
+          { output: "eventsource.argoproj.io/minio-drop-zone created" },
+          { output: "sensor.argoproj.io/unzip-sensor created" },
+        ],
+
+        hints: [
+          "kubectl apply -f eventsource.yaml -f sensor.yaml -n argo",
+          "kubectl get eventsource,sensor -n argo   ← check they exist",
+        ],
+
+        async validator(answer) {
+          if (!answer.trim()) return { ok: false, message: "Type 'done' when ready." };
+
+          // Check EventSource via Argo Events API
+          let esRes;
+          try {
+            esRes = await httpGet(
+              `${ARGO_API}/api/v1/event-sources/${NAMESPACE}/minio-drop-zone`
+            );
+          } catch (err) {
+            if (err.code === "ECONNREFUSED" || err.code === "ETIMEOUT") {
+              return {
+                ok: false,
+                message: `Cannot reach Argo Server at ${ARGO_API}. Run: kubectl port-forward svc/argo-server 2746:2746 -n argo`,
+              };
+            }
+            return { ok: false, message: `Argo API error: ${err.message}` };
+          }
+
+          if (esRes.status === 404) {
+            return {
+              ok: false,
+              message: "EventSource 'minio-drop-zone' not found in namespace 'argo'.",
+            };
+          }
+          if (esRes.status !== 200) {
+            return { ok: false, message: `EventSource API returned HTTP ${esRes.status}` };
+          }
+
+          // Verify the EventSource watches the right bucket
+          const s3Config = esRes.body?.spec?.minio?.["drop-zone"] || {};
+          if (s3Config.bucket?.name && s3Config.bucket.name !== "drop-zone") {
+            return {
+              ok: false,
+              message: `EventSource is watching bucket '${s3Config.bucket?.name}' — expected 'drop-zone'.`,
+            };
+          }
+
+          // Check Sensor
+          let sensorRes;
+          try {
+            sensorRes = await httpGet(
+              `${ARGO_API}/api/v1/sensors/${NAMESPACE}/unzip-sensor`
+            );
+          } catch (err) {
+            return { ok: false, message: `Argo API error checking sensor: ${err.message}` };
+          }
+
+          if (sensorRes.status === 404) {
+            return {
+              ok: false,
+              message: "Sensor 'unzip-sensor' not found. EventSource exists — now deploy the Sensor.",
+            };
+          }
+          if (sensorRes.status !== 200) {
+            return { ok: false, message: `Sensor API returned HTTP ${sensorRes.status}` };
+          }
+
+          // Verify the Sensor references the WorkflowTemplate
+          const triggers = sensorRes.body?.spec?.triggers || [];
+          const hasWorkflowTrigger = triggers.some(t =>
+            t.template?.argoWorkflow?.source?.resource?.metadata?.name === "unzip-pipeline" ||
+            JSON.stringify(t).includes("unzip-pipeline")
+          );
+
+          if (!hasWorkflowTrigger) {
+            return {
+              ok: false,
+              message: "Sensor exists but doesn't appear to reference WorkflowTemplate 'unzip-pipeline'.",
+            };
+          }
+
+          return {
+            ok: true,
+            message: "EventSource 'minio-drop-zone' and Sensor 'unzip-sensor' are deployed and wired ✓",
+          };
+        },
+      },
+
+      // ── Challenge 304 ─────────────────────────────────────────────────────────
+      {
+        id: 304,
+        title: "The Live Run",
+        category: "DevOps",
+        difficulty: "expert",
+        points: 100,
+
+        description: [
+          "Everything is in place. Time for a live end-to-end test.",
+          "",
+          "The validator will:",
+          "  1. Upload a test zip to drop-zone/incoming/voyager-test.zip",
+          "  2. Wait up to 90 seconds for Argo to pick it up and run",
+          "  3. Check that drop-zone/processed/manifest.txt exists",
+          "  4. Verify its contents are exactly: ARCHIVON_PAYLOAD",
+          "",
+          "You do not need to upload anything — the validator does it.",
+          "Just make sure the full pipeline is running, then type 'done'.",
+          "",
+          "  Port-forwards required:",
+          "    MinIO  : localhost:9000",
+          "    Argo   : localhost:2746",
+        ].join("\n"),
+
+        examples: [
+          { output: "processed/manifest.txt", explanation: "Expected object after workflow completes" },
+        ],
+
+        hints: [
+          "Check workflow runs: kubectl get workflows -n argo",
+          "Watch logs: kubectl logs -n argo -l workflows.argoproj.io/workflow -f",
+          "If the workflow never starts: kubectl get eventsource,sensor,eventbus -n argo",
+          "If the workflow fails: argo logs <workflow-name> -n argo",
+        ],
+
+        async validator(answer) {
+          if (!answer.trim()) return { ok: false, message: "Type 'done' when the pipeline is ready." };
+
+          let Minio;
+          try { Minio = require("minio"); }
+          catch { return { ok: false, message: "Missing dependency: npm install minio" }; }
+
+          const client = new Minio.Client({
+            endPoint: MINIO.endPoint,
+            port: MINIO.port,
+            useSSL: MINIO.useSSL,
+            accessKey: MINIO.accessKey,
+            secretKey: MINIO.secretKey,
+          });
+
+          // ── Step 1: verify bucket exists ──────────────────────────────────────
+          try {
+            const exists = await client.bucketExists("drop-zone");
+            if (!exists) {
+              return { ok: false, message: "Bucket 'drop-zone' not found — complete challenge 301 first." };
+            }
+          } catch (err) {
+            return { ok: false, message: `Cannot reach MinIO: ${err.message}` };
+          }
+
+          // ── Step 2: clean up any previous test run ────────────────────────────
+          try {
+            await client.removeObject("drop-zone", "processed/manifest.txt");
+          } catch { /* doesn't exist yet — fine */ }
+
+          // ── Step 3: upload the test zip ───────────────────────────────────────
+          const zip = buildTestZip();
+          const zipKey = "incoming/voyager-test.zip";
+
+          console.log("\n  ▶ Uploading test zip to drop-zone/incoming/voyager-test.zip ...");
+          try {
+            await putObject(client, "drop-zone", zipKey, zip);
+          } catch (err) {
+            return { ok: false, message: `Failed to upload test zip: ${err.message}` };
+          }
+          console.log("  ✔ Zip uploaded — waiting for Argo to process it ...");
+
+          // ── Step 4: poll processed/ for up to 90 seconds ─────────────────────
+          const POLL_INTERVAL = 5000;
+          const TIMEOUT = 90_000;
+          const start = Date.now();
+          let found = false;
+
+          while (Date.now() - start < TIMEOUT) {
+            await sleep(POLL_INTERVAL);
+            const elapsed = Math.round((Date.now() - start) / 1000);
+            process.stdout.write(`\r  ⏳ Waiting... ${elapsed}s / 90s`);
+
+            try {
+              const keys = await listObjects(client, "drop-zone", "processed/manifest.txt");
+              if (keys.includes("processed/manifest.txt")) { found = true; break; }
+            } catch { /* keep polling */ }
+          }
+          process.stdout.write("\r" + " ".repeat(40) + "\r");
+
+          if (!found) {
+            return {
+              ok: false,
+              message: [
+                "Timed out after 90s — processed/manifest.txt never appeared.",
+                "Check: kubectl get workflows -n argo",
+                "       kubectl get eventsource,sensor -n argo",
+              ].join("\n  "),
+            };
+          }
+
+          // ── Step 5: verify file contents ──────────────────────────────────────
+          let content = "";
+          try {
+            content = await readObject(client, "drop-zone", "processed/manifest.txt");
+          } catch (err) {
+            return { ok: false, message: `Could not read processed/manifest.txt: ${err.message}` };
+          }
+
+          if (!content.includes("ARCHIVON_PAYLOAD")) {
+            return {
+              ok: false,
+              message: `processed/manifest.txt exists but has wrong content.\nExpected: "ARCHIVON_PAYLOAD"\nGot:      "${content.trim()}"`,
+            };
+          }
+
+          return {
+            ok: true,
+            message: "End-to-end pipeline confirmed ✓  Zip uploaded → workflow triggered → file extracted to processed/",
+          };
+        },
+      },
+
+    ], // end challenges
+  }
 ];
+
+// ── Helper used by challenge 304 ─────────────────────────────────────────────
+function readObject(client, bucket, key) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    client.getObject(bucket, key, (err, stream) => {
+      if (err) return reject(err);
+      stream.on("data",  chunk => { data += chunk.toString(); });
+      stream.on("end",   ()    => resolve(data));
+      stream.on("error", reject);
+    });
+  });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Build a minimal valid zip in memory (no deps — pure JS)
+// Contains a single file "manifest.txt" with content "ARCHIVON_PAYLOAD"
+function buildTestZip() {
+  // Tiny but valid ZIP with one stored (uncompressed) file
+  const filename    = Buffer.from("manifest.txt");
+  const fileContent = Buffer.from("ARCHIVON_PAYLOAD\n");
+  const now         = new Date();
+  const dosDate     = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const dosTime     = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+
+  // CRC-32
+  let crc = 0xFFFFFFFF;
+  for (const byte of fileContent) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+  }
+  crc = (crc ^ 0xFFFFFFFF) >>> 0;
+
+  const localHeader = Buffer.alloc(30 + filename.length);
+  localHeader.writeUInt32LE(0x04034b50, 0);  // local file header signature
+  localHeader.writeUInt16LE(20,          4);  // version needed
+  localHeader.writeUInt16LE(0,           6);  // flags
+  localHeader.writeUInt16LE(0,           8);  // compression: stored
+  localHeader.writeUInt16LE(dosTime,    10);
+  localHeader.writeUInt16LE(dosDate,    12);
+  localHeader.writeUInt32LE(crc,        14);
+  localHeader.writeUInt32LE(fileContent.length, 18);  // compressed size
+  localHeader.writeUInt32LE(fileContent.length, 22);  // uncompressed size
+  localHeader.writeUInt16LE(filename.length,    26);
+  localHeader.writeUInt16LE(0,          28);  // extra field length
+  filename.copy(localHeader, 30);
+
+  const centralDir = Buffer.alloc(46 + filename.length);
+  centralDir.writeUInt32LE(0x02014b50, 0);  // central dir signature
+  centralDir.writeUInt16LE(20,          4);
+  centralDir.writeUInt16LE(20,          6);
+  centralDir.writeUInt16LE(0,           8);
+  centralDir.writeUInt16LE(0,          10);
+  centralDir.writeUInt16LE(dosTime,    12);
+  centralDir.writeUInt16LE(dosDate,    14);
+  centralDir.writeUInt32LE(crc,        16);
+  centralDir.writeUInt32LE(fileContent.length, 20);
+  centralDir.writeUInt32LE(fileContent.length, 24);
+  centralDir.writeUInt16LE(filename.length,    28);
+  centralDir.writeUInt16LE(0,          30);  // extra
+  centralDir.writeUInt16LE(0,          32);  // comment
+  centralDir.writeUInt16LE(0,          34);  // disk start
+  centralDir.writeUInt16LE(0,          36);  // int attrs
+  centralDir.writeUInt32LE(0,          38);  // ext attrs
+  centralDir.writeUInt32LE(0,          42);  // local header offset
+  filename.copy(centralDir, 46);
+
+  const localHeaderSize = localHeader.length + fileContent.length;
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);  // end of central dir signature
+  eocd.writeUInt16LE(0,           4);
+  eocd.writeUInt16LE(0,           6);
+  eocd.writeUInt16LE(1,           8);  // total entries this disk
+  eocd.writeUInt16LE(1,          10);  // total entries
+  eocd.writeUInt32LE(centralDir.length, 12);
+  eocd.writeUInt32LE(localHeaderSize,   16);  // central dir offset
+  eocd.writeUInt16LE(0,          20);
+
+  return Buffer.concat([localHeader, fileContent, centralDir, eocd]);
+}
+
+// Stream a Buffer to MinIO as an object
+function putObject(client, bucket, key, buffer) {
+  const { Readable } = require("stream");
+  const stream = Readable.from(buffer);
+  return new Promise((resolve, reject) => {
+    client.putObject(bucket, key, stream, buffer.length, (err, etag) => {
+      if (err) reject(err); else resolve(etag);
+    });
+  });
+}
+
+// List objects under a prefix, return array of key strings
+function listObjects(client, bucket, prefix) {
+  return new Promise((resolve, reject) => {
+    const keys   = [];
+    const stream = client.listObjects(bucket, prefix, true);
+    stream.on("data", obj => keys.push(obj.name));
+    stream.on("end",  ()  => resolve(keys));
+    stream.on("error", reject);
+  });
+}
 
 module.exports = PLANETS;
